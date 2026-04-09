@@ -38,7 +38,7 @@ const NAV_BY_ROLE = {
 };
 
 // ─── API ──────────────────────────────────────────────────────────────────────
-const API_BASE = "http://localhost:5000/api";
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000/api";
 const api = {
   _token: () => localStorage.getItem("sw_token"),
   _campus: () => localStorage.getItem("sw_campus") || "swla",
@@ -2039,6 +2039,7 @@ function Reports({user}) {
     {id:"billing",    title:"Fee Defaulters",       desc:"Outstanding & overdue accounts",     icon:"billing",     color:theme.red,       roles:["admin","accountant"]},
     {id:"enrollment", title:"Enrolment Report",     desc:"Learner count by form",              icon:"students",    color:theme.grey,      roles:["admin","principal"]},
     {id:"remedial",   title:"Remedial List",        desc:"Learners needing extra support",     icon:"book",        color:theme.amber,     roles:["admin","principal","teacher"]},
+    {id:"ed46",       title:"ED46 Government Form",  desc:"Official MoE learner register",      icon:"results",     color:"#7C3AED",       roles:["admin","principal"]},
   ];
   const reportTypes=allReportTypes.filter(r=>r.roles.includes(user.role));
 
@@ -2050,6 +2051,7 @@ function Reports({user}) {
       else if(reportType==="billing"){const d=await api.invoices({grade:genForm,limit:100,status:"Unpaid,Overdue"});setPreview({type:"billing",rows:d.invoices});}
       else if(reportType==="enrollment"){const d=await api.students({grade:genForm,limit:100});setPreview({type:"enrollment",rows:d.students,total:d.pagination.total});}
       else if(reportType==="remedial"){const d=await api.results({term,year:CURRENT_YEAR.toString(),grade:genForm,limit:100});setPreview({type:"remedial",rows:d.results?.filter(r=>["D","E","U","F","G"].includes(r.grade))});}
+      else if(reportType==="ed46"){const d=await api.students({grade:genForm,limit:500,status:"Active"});setPreview({type:"ed46",rows:d.students,form:genForm});}
     }catch(e){setError(e.message);}
     finally{setLoading(false);}
   };
@@ -2061,6 +2063,7 @@ function Reports({user}) {
       performance: r=>({Learner:`${r.last_name||r.first_name} ${r.first_name}`,Form:r.student_grade,Subject:r.subject_name,Mark:r.total,Grade:r.grade}),
       billing:     r=>({Invoice:r.invoice_no,Learner:`${r.last_name||r.first_name} ${r.first_name}`,Form:r.grade,Term:r.term,Due:r.amount_due,Paid:r.amount_paid,Balance:r.balance,Status:r.status}),
       enrollment:  r=>({ID:r.student_id,Surname:r.last_name,Firstname:r.first_name,Form:FORM_LABEL[r.grade]||r.grade,Status:r.status}),
+      ed46:        r=>({RegNo:r.student_id,"Surname":r.last_name,"First Names":r.first_name,"DOB":r.date_of_birth?.split("T")[0]||"","Gender":r.gender||"","Form":FORM_LABEL[r.grade]||r.grade,"Parent/Guardian":r.parent_name||"","Contact":r.parent_phone||"","Status":r.status}),
       remedial:    r=>({Learner:`${r.last_name||r.first_name} ${r.first_name}`,Form:r.student_grade,Subject:r.subject_name,Mark:r.total,Grade:r.grade}),
     };
     exportCSV(preview.rows.map(maps[reportType]),`${reportType}-report-${CURRENT_YEAR}.csv`);
@@ -2107,6 +2110,56 @@ function Reports({user}) {
                 {preview.type==="attendance"&&<table><thead><tr style={{background:"#FEF2F2"}}><th>Learner</th><th>Form</th><th>Present</th><th>Absent</th><th>Rate</th></tr></thead><tbody>{preview.rows?.map((r,i)=><tr key={i}><td style={{fontWeight:500,fontSize:13}}>{r.last_name||r.first_name}, {r.first_name}</td><td><Badge color="tq">{FORM_LABEL[r.grade]||r.grade}</Badge></td><td style={{color:theme.green,fontWeight:600}}>{r.present_days}</td><td style={{color:theme.danger,fontWeight:600}}>{r.absent_days}</td><td><Badge color={parseFloat(r.attendance_rate)>=80?"green":"red"}>{r.attendance_rate}%</Badge></td></tr>)}</tbody></table>}
                 {preview.type==="billing"&&<table><thead><tr style={{background:"#FEF2F2"}}><th>Learner</th><th>Invoice</th><th>Due</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead><tbody>{preview.rows?.map((r,i)=><tr key={i}><td style={{fontWeight:500,fontSize:13}}>{r.last_name||r.first_name}, {r.first_name}</td><td style={{fontFamily:"monospace",fontSize:12}}>{r.invoice_no}</td><td style={{fontFamily:"monospace"}}>${parseFloat(r.amount_due).toFixed(2)}</td><td style={{fontFamily:"monospace",color:theme.green}}>${parseFloat(r.amount_paid).toFixed(2)}</td><td style={{fontFamily:"monospace",color:parseFloat(r.balance)>0?theme.danger:theme.textMuted,fontWeight:600}}>${parseFloat(r.balance).toFixed(2)}</td><td><Badge color={r.status==="Paid"?"green":r.status==="Partial"?"amber":"red"}>{r.status}</Badge></td></tr>)}</tbody></table>}
                 {preview.type==="enrollment"&&<table><thead><tr style={{background:"#FEF2F2"}}><th>ID</th><th>Learner</th><th>Form</th><th>Status</th></tr></thead><tbody>{preview.rows?.map((r,i)=><tr key={i}><td style={{fontFamily:"monospace",fontSize:12,color:theme.turquoise}}>{r.student_id}</td><td style={{fontWeight:500,fontSize:13}}>{r.last_name}, {r.first_name}</td><td><Badge color="tq">{FORM_LABEL[r.grade]||r.grade}</Badge></td><td><Badge color={r.status==="Active"?"green":"gray"}>{r.status}</Badge></td></tr>)}</tbody></table>}
+                {preview.type==="ed46"&&(
+                  <div>
+                    <div style={{padding:"10px 16px",background:"#7C3AED08",borderBottom:`1px solid ${theme.border}`,display:"flex",gap:16,flexWrap:"wrap",fontSize:12,color:"#7C3AED",fontWeight:600}}>
+                      <span>REPUBLIC OF ZIMBABWE — MINISTRY OF EDUCATION</span>
+                      <span>ED46 — FORM REGISTER</span>
+                      <span>{SCHOOL.name} — {SCHOOL.campuses[0].name}</span>
+                      <span>Academic Year: {CURRENT_YEAR}</span>
+                      {preview.form&&<span>Form: {FORM_LABEL[preview.form]||preview.form}</span>}
+                    </div>
+                    <div style={{overflowX:"auto"}}>
+                      <table>
+                        <thead><tr style={{background:"#7C3AED18"}}>
+                          <th style={{fontSize:11}}>No.</th>
+                          <th style={{fontSize:11}}>Reg No.</th>
+                          <th style={{fontSize:11}}>SURNAME</th>
+                          <th style={{fontSize:11}}>FIRST NAMES</th>
+                          <th style={{fontSize:11}}>DATE OF BIRTH</th>
+                          <th style={{fontSize:11}}>GENDER</th>
+                          <th style={{fontSize:11}}>FORM</th>
+                          <th style={{fontSize:11}}>PARENT/GUARDIAN</th>
+                          <th style={{fontSize:11}}>CONTACT</th>
+                          <th style={{fontSize:11}}>STATUS</th>
+                        </tr></thead>
+                        <tbody>
+                          {preview.rows?.map((r,i)=>(
+                            <tr key={r.id} style={{background:i%2===0?"white":"#FAFAFA"}}>
+                              <td style={{fontSize:11,color:theme.textMuted,width:32}}>{i+1}</td>
+                              <td style={{fontFamily:"monospace",fontSize:11,color:"#7C3AED",fontWeight:600}}>{r.student_id}</td>
+                              <td style={{fontWeight:600,fontSize:12,textTransform:"uppercase"}}>{r.last_name}</td>
+                              <td style={{fontSize:12}}>{r.first_name}</td>
+                              <td style={{fontSize:11,color:theme.textMuted}}>{r.date_of_birth?.split("T")[0]||"—"}</td>
+                              <td style={{fontSize:11}}>{r.gender||"—"}</td>
+                              <td><Badge color="tq">{FORM_LABEL[r.grade]||r.grade}</Badge></td>
+                              <td style={{fontSize:11}}>{r.parent_name||"—"}</td>
+                              <td style={{fontSize:11,fontFamily:"monospace"}}>{r.parent_phone||"—"}</td>
+                              <td><Badge color={r.status==="Active"?"green":"gray"}>{r.status}</Badge></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div style={{padding:"10px 16px",borderTop:`1px solid ${theme.border}`,display:"flex",justifyContent:"space-between",fontSize:11,color:theme.textMuted}}>
+                      <span>Total Learners: <strong>{preview.rows?.length}</strong></span>
+                      <span>Male: <strong>{preview.rows?.filter(r=>r.gender==="Male").length||0}</strong></span>
+                      <span>Female: <strong>{preview.rows?.filter(r=>r.gender==="Female").length||0}</strong></span>
+                      <span>Active: <strong>{preview.rows?.filter(r=>r.status==="Active").length||0}</strong></span>
+                      <span>Generated: {new Date().toLocaleDateString("en-GB")}</span>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -3303,6 +3356,7 @@ function TeacherSubjectAssignments({teacherId, teacherName, profileData, profile
       .then(d=>setSubjects(d.subjects||[]))
       .catch(e=>toast(e.message,"error"))
       .finally(()=>setLoadingSubj(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[newForm]);
 
   const handleAdd = async () => {
@@ -3454,6 +3508,7 @@ function TeacherSubjectAssignments({teacherId, teacherName, profileData, profile
 
 // ─── Timetable ────────────────────────────────────────────────────────────────
 const DAYS    = ["Monday","Tuesday","Wednesday","Thursday","Friday"];
+// eslint-disable-next-line no-unused-vars
 const DAY_SHORT = {"Monday":"Mon","Tuesday":"Tue","Wednesday":"Wed","Thursday":"Thu","Friday":"Fri"};
 const PERIODS = [1,2,3,4,5,6,7,8];
 const PERIOD_TIMES = {
@@ -3863,7 +3918,6 @@ function Timetable({user}) {
 // ─── HR & Staff Module ────────────────────────────────────────────────────────
 function HRModule({user}) {
   const toast = useToast();
-  const [tab,      setTab]      = useState("staff");
   const [modal,    setModal]    = useState(null);
   const [selected, setSelected] = useState(null);
   const [saving,   setSaving]   = useState(false);
@@ -3941,6 +3995,7 @@ function HRModule({user}) {
     } catch(e) { toast(e.message,"error"); }
   };
 
+  // eslint-disable-next-line no-unused-vars
   const departments = [...new Set(staff.map(s=>s.department).filter(Boolean))].sort();
 
   const activeCount     = staff.filter(s=>s.employment_status==="Active").length;
