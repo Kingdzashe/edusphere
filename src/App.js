@@ -38,7 +38,7 @@ const NAV_BY_ROLE = {
 };
 
 // ─── API ──────────────────────────────────────────────────────────────────────
-const API_BASE = process.env.REACT_APP_API_URL || "https://edusphere-backend-1pcs.onrender.com/api";
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:5000/api";
 const api = {
   _token: () => localStorage.getItem("sw_token"),
   _campus: () => localStorage.getItem("sw_campus") || "swla",
@@ -112,6 +112,10 @@ const api = {
   // Parent-scoped endpoints — only return data for their linked children
   myChildren:       ()      => api.get("/students/my-children"),
   myStudents:       ()      => api.get("/students/my-students"),
+  searchStudents:   (q,form)=> api.get(`/students/search?q=${encodeURIComponent(q)}${form?`&form=${form}`:""}`),
+  getStudent:       (id)    => api.get(`/students/${id}`),
+  studentResults:   (id,q)  => api.get(`/results/student/${id}${q?`?${new URLSearchParams(q)}`:""}`),
+  classResults:     (form,q)=> api.get(`/results/class/${form}?${new URLSearchParams(q)}`),
   // Timetable
   timetable:        (q)  => api.get(`/timetable?${new URLSearchParams(q)}`),
   timetableTeachers:()   => api.get("/timetable/teachers"),
@@ -802,6 +806,354 @@ function NoticesTicker() {
   );
 }
 
+// ─── StudentSearchPicker ──────────────────────────────────────────────────────
+// Searchable dropdown for picking a student — replaces raw ID input
+function StudentSearchPicker({value, onChange, placeholder="Search by name or ID...", formFilter}) {
+  const [query,    setQuery]   = useState(value?.label||"");
+  const [results,  setResults] = useState([]);
+  const [open,     setOpen]    = useState(false);
+  const [loading,  setLoading] = useState(false);
+  const dQuery = useDebounce(query, 300);
+
+  React.useEffect(()=>{
+    if (!dQuery || dQuery.length < 1) { setResults([]); return; }
+    setLoading(true);
+    api.searchStudents(dQuery, formFilter)
+      .then(d=>setResults(d.students||[]))
+      .catch(()=>setResults([]))
+      .finally(()=>setLoading(false));
+  },[dQuery, formFilter]);
+
+  const select = (s) => {
+    const label = `${s.last_name}, ${s.first_name} (${s.student_id})`;
+    setQuery(label);
+    setOpen(false);
+    setResults([]);
+    onChange({id:s.id, label, form:s.form||s.grade, studentId:s.student_id});
+  };
+
+  return (
+    <div style={{position:"relative"}}>
+      <input
+        className="form-input"
+        placeholder={placeholder}
+        value={query}
+        onChange={e=>{setQuery(e.target.value);setOpen(true);if(!e.target.value)onChange(null);}}
+        onFocus={()=>setOpen(true)}
+        onBlur={()=>setTimeout(()=>setOpen(false),200)}
+        autoComplete="off"
+      />
+      {open && (query.length>=1) && (
+        <div style={{position:"absolute",top:"100%",left:0,right:0,zIndex:100,background:"white",border:`1px solid ${theme.border}`,borderRadius:8,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",maxHeight:240,overflowY:"auto"}}>
+          {loading && <div style={{padding:"10px 14px",fontSize:13,color:theme.textMuted}}>Searching…</div>}
+          {!loading && results.length===0 && query.length>=1 && (
+            <div style={{padding:"10px 14px",fontSize:13,color:theme.textMuted}}>No learners found for "{query}"</div>
+          )}
+          {results.map(s=>(
+            <div key={s.id} onMouseDown={()=>select(s)}
+              style={{padding:"10px 14px",cursor:"pointer",borderBottom:`1px solid ${theme.border}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}
+              onMouseOver={e=>e.currentTarget.style.background="#F8FAFC"}
+              onMouseOut={e=>e.currentTarget.style.background="white"}>
+              <div>
+                <p style={{fontWeight:600,fontSize:13}}>{s.last_name}, {s.first_name}</p>
+                <p style={{fontSize:11,color:theme.textMuted}}>{FORM_LABEL[s.form||s.grade]||s.form} · Class {s.class}</p>
+              </div>
+              <span style={{fontFamily:"monospace",fontSize:11,color:theme.turquoise,fontWeight:700}}>{s.student_id}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── StudentProfile ───────────────────────────────────────────────────────────
+// Full student profile modal — shows all info + compiled results + attendance
+function StudentProfile({studentId, user, onClose}) {
+  const toast = useToast();
+  const [profileTab, setProfileTab] = useState("overview");
+  const [term, setTerm] = useState("Term 1");
+  const [year, setYear] = useState(CURRENT_YEAR.toString());
+  const [reportType, setReportType] = useState("term_report");
+
+  // Load student data
+  const {data:stuData, loading:stuLoading} = useFetch(
+    ()=>api.getStudent(studentId), [studentId]
+  );
+  const student = stuData?.student;
+
+  // Load results for this student
+  const {data:resData, loading:resLoading, reload:reloadRes} = useFetch(
+    ()=>api.studentResults(studentId, {report_type:reportType}),
+    [studentId, reportType]
+  );
+  const allResults = resData?.results || [];
+
+  // Load attendance
+  const {data:attData, loading:attLoading} = useFetch(
+    ()=>api.attendanceReport({student_id:studentId}), [studentId]
+  );
+  const attSummary = attData?.report?.[0] || null;
+
+  // Load attendance records
+  const {data:attRecords} = useFetch(
+    ()=>api.attendance({student_id:studentId, limit:60}), [studentId]
+  );
+  const attendance = attRecords?.attendance || [];
+
+  // Filter results by term+year selection
+  const termResults = allResults.filter(r=>
+    (!term || r.term===term) && (!year || String(r.year)===String(year))
+  );
+
+  // Group results by subject
+  const bySubject = termResults.reduce((acc,r)=>{
+    if(!acc[r.subject_id]) acc[r.subject_id]={name:r.subject_name,curriculum:r.curriculum,entries:[]};
+    acc[r.subject_id].entries.push(r);
+    return acc;
+  },{});
+
+  // Group all results by term for history view
+  const byTerm = allResults.reduce((acc,r)=>{
+    const key=`${r.year}|${r.term}|${r.report_type}`;
+    if(!acc[key]) acc[key]={year:r.year,term:r.term,report_type:r.report_type,results:[]};
+    acc[key].results.push(r);
+    return acc;
+  },{});
+
+  const canEdit = ["admin","teacher","principal"].includes(user.role);
+
+  if (stuLoading) return (
+    <Modal title="Learner Profile" onClose={onClose} large>
+      <div style={{padding:40,textAlign:"center"}}><span className="spinner spinner-dark"/></div>
+    </Modal>
+  );
+  if (!student) return null;
+
+  const attRate = attSummary ? parseFloat(attSummary.attendance_rate||0) : null;
+
+  return (
+    <Modal title={`${student.last_name}, ${student.first_name}`} onClose={onClose} large>
+      {/* Profile banner */}
+      <div style={{display:"flex",gap:16,alignItems:"center",padding:"16px 20px",background:`linear-gradient(135deg,${theme.sidebarTop},${theme.red})`,borderRadius:12,marginBottom:16}}>
+        <div style={{width:56,height:56,borderRadius:"50%",background:`linear-gradient(135deg,${theme.turquoise},white)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:700,color:theme.red,flexShrink:0}}>
+          {student.first_name[0]}{student.last_name[0]}
+        </div>
+        <div style={{flex:1}}>
+          <p style={{color:"white",fontWeight:700,fontSize:17,fontFamily:"'Playfair Display',serif"}}>{student.last_name}, {student.first_name}</p>
+          <p style={{color:"rgba(255,255,255,0.7)",fontSize:13}}>{FORM_LABEL[student.form]||student.form} · Class {student.class} · {student.student_id}</p>
+          <div style={{display:"flex",gap:8,marginTop:4}}>
+            <Badge color={student.status==="Active"?"green":"gray"}>{student.status}</Badge>
+            <Badge color={student.gender==="Female"?"red":"tq"}>{student.gender}</Badge>
+          </div>
+        </div>
+        {attRate!==null&&(
+          <div style={{textAlign:"center",background:"rgba(255,255,255,0.15)",padding:"10px 16px",borderRadius:10}}>
+            <p style={{fontSize:22,fontWeight:700,color:"white"}}>{attRate}%</p>
+            <p style={{fontSize:11,color:"rgba(255,255,255,0.7)"}}>Attendance</p>
+          </div>
+        )}
+      </div>
+
+      {/* Tab nav */}
+      <div style={{display:"flex",gap:0,marginBottom:16,borderBottom:`1px solid ${theme.border}`}}>
+        {[
+          ["overview","📋 Overview"],
+          ["results","📊 Results"],
+          ["attendance","📅 Attendance"],
+          ["info","ℹ️ Personal Info"],
+        ].map(([id,label])=>(
+          <button key={id} onClick={()=>setProfileTab(id)}
+            style={{padding:"9px 16px",border:"none",background:"none",cursor:"pointer",fontWeight:profileTab===id?700:500,fontSize:13,color:profileTab===id?theme.red:theme.textMuted,borderBottom:`2px solid ${profileTab===id?theme.red:"transparent"}`,marginBottom:"-1px"}}>
+            {label}
+          </button>
+        ))}
+        <div style={{marginLeft:"auto",display:"flex",gap:8,paddingBottom:4}}>
+          <Btn size="sm" variant="tq" icon="download"
+            onClick={()=>window.open(api.reportCardURL(studentId,{term,year,report_type:reportType}),"_blank")}>
+            PDF Report
+          </Btn>
+        </div>
+      </div>
+
+      {/* OVERVIEW TAB */}
+      {profileTab==="overview"&&(
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}}>
+            {[
+              ["Term Results",termResults.length,theme.turquoise],
+              ["Attendance Rate",attRate!==null?`${attRate}%`:"—",attRate>=80?theme.green:theme.danger],
+              ["Form",FORM_LABEL[student.form]||student.form,theme.red],
+            ].map(([l,v,c])=>(
+              <div key={l} style={{background:"white",padding:14,borderRadius:10,textAlign:"center",border:`1px solid ${theme.border}`,borderTop:`3px solid ${c}`}}>
+                <p style={{fontSize:22,fontWeight:700,color:c,fontFamily:"'Playfair Display',serif"}}>{v}</p>
+                <p style={{fontSize:11,fontWeight:600,color:theme.textMuted,textTransform:"uppercase"}}>{l}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Quick result summary for current term */}
+          {termResults.length>0&&(
+            <div>
+              <p style={{fontSize:12,fontWeight:700,color:theme.red,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:10}}>
+                {term} {year} — {reportType==="mark_reader"?"Mark Reader":"Term Report"}
+              </p>
+              <div style={{border:`1px solid ${theme.border}`,borderRadius:10,overflow:"hidden"}}>
+                {Object.values(bySubject).map((subj,i,arr)=>(
+                  <div key={subj.name} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderBottom:i<arr.length-1?`1px solid ${theme.border}`:"none"}}>
+                    <div>
+                      <p style={{fontWeight:600,fontSize:13}}>{subj.name}</p>
+                      <p style={{fontSize:11,color:theme.textMuted}}>{(subj.curriculum||"").replace("_"," ")}</p>
+                    </div>
+                    {subj.entries.map((e,j)=>(
+                      <div key={j} style={{textAlign:"right"}}>
+                        <span className="badge" style={{background:`${GRADE_COLOR[e.grade]||"#64748B"}20`,color:GRADE_COLOR[e.grade]||"#64748B",fontWeight:700,fontSize:14}}>{e.grade}</span>
+                        <p style={{fontSize:12,color:theme.textMuted,marginTop:2}}>{parseFloat(e.mark||0).toFixed(0)}%</p>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {termResults.length===0&&!resLoading&&(
+            <div style={{padding:24,textAlign:"center",color:theme.textMuted,fontSize:13}}>No results for {term} {year} yet.</div>
+          )}
+        </div>
+      )}
+
+      {/* RESULTS TAB */}
+      {profileTab==="results"&&(
+        <div>
+          {/* Filters */}
+          <div style={{display:"flex",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+            <select className="form-input" style={{width:120}} value={term} onChange={e=>setTerm(e.target.value)}>
+              {TERMS.map(t=><option key={t}>{t}</option>)}
+            </select>
+            <select className="form-input" style={{width:110}} value={year} onChange={e=>setYear(e.target.value)}>
+              {[2026,2025,2024].map(y=><option key={y}>{y}</option>)}
+            </select>
+            <div style={{display:"flex",gap:6}}>
+              {[["term_report","Term Report"],["mark_reader","Mark Reader"]].map(([id,lbl])=>(
+                <button key={id} onClick={()=>setReportType(id)}
+                  style={{padding:"6px 12px",borderRadius:8,border:`1.5px solid ${reportType===id?theme.red:theme.border}`,background:reportType===id?"#FEF2F2":"white",color:reportType===id?theme.red:theme.textMuted,fontSize:12,fontWeight:600,cursor:"pointer"}}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {resLoading&&<div style={{textAlign:"center",padding:24}}><span className="spinner spinner-dark"/></div>}
+
+          {!resLoading&&termResults.length===0&&(
+            <div style={{padding:24,textAlign:"center",color:theme.textMuted,fontSize:13}}>No results for this selection.</div>
+          )}
+
+          {/* Results table */}
+          {termResults.length>0&&(
+            <div style={{border:`1px solid ${theme.border}`,borderRadius:10,overflow:"hidden"}}>
+              <table>
+                <thead><tr style={{background:"#FEF2F2"}}>
+                  <th>Subject</th><th>Curriculum</th><th>Mark</th>
+                  {reportType==="mark_reader"&&<><th>Effort</th><th>Class Avg</th></>}
+                  <th>Grade</th><th>Remarks</th>
+                </tr></thead>
+                <tbody>
+                  {termResults.map((r,i)=>(
+                    <tr key={i}>
+                      <td style={{fontWeight:600,fontSize:13}}>{r.subject_name}</td>
+                      <td style={{fontSize:11,color:theme.textMuted}}>{(r.curriculum||"").replace("_"," ")}</td>
+                      <td style={{fontWeight:700}}>{parseFloat(r.mark||0).toFixed(0)}%</td>
+                      {reportType==="mark_reader"&&<td style={{fontSize:12}}>{EFFORT_LABEL[r.effort]||"—"}</td>}
+                      {reportType==="mark_reader"&&<td style={{fontSize:12,color:theme.textMuted}}>{r.class_average?`${parseFloat(r.class_average).toFixed(0)}%`:"—"}</td>}
+                      <td><span className="badge" style={{background:`${GRADE_COLOR[r.grade]||"#64748B"}20`,color:GRADE_COLOR[r.grade]||"#64748B",fontWeight:700}}>{r.grade}</span></td>
+                      <td style={{fontSize:12,color:theme.textMuted}}>{r.remarks||"—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* All terms history */}
+          {Object.keys(byTerm).length>0&&(
+            <div style={{marginTop:16}}>
+              <p style={{fontSize:12,fontWeight:700,color:theme.textMuted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>All Terms History</p>
+              <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+                {Object.values(byTerm).map((t,i)=>(
+                  <div key={i} style={{padding:"6px 14px",borderRadius:8,border:`1px solid ${theme.border}`,fontSize:12,cursor:"pointer",background:term===t.term&&year===String(t.year)&&reportType===t.report_type?"#FEF2F2":"white"}}
+                    onClick={()=>{setTerm(t.term);setYear(String(t.year));setReportType(t.report_type);}}>
+                    <span style={{fontWeight:600}}>{t.term} {t.year}</span>
+                    <span style={{color:theme.textMuted,marginLeft:6}}>{t.report_type==="mark_reader"?"MR":"TR"}</span>
+                    <span style={{marginLeft:6,color:theme.turquoise}}>{t.results.length} subjects</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ATTENDANCE TAB */}
+      {profileTab==="attendance"&&(
+        <div>
+          {attSummary&&(
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:16}}>
+              {[
+                ["Days Present",attSummary.present_days||0,theme.green],
+                ["Days Absent",attSummary.absent_days||0,theme.danger],
+                ["Rate",`${attSummary.attendance_rate||0}%`,parseFloat(attSummary.attendance_rate)>=80?theme.green:theme.danger],
+              ].map(([l,v,c])=>(
+                <div key={l} style={{background:"white",padding:14,borderRadius:10,textAlign:"center",border:`1px solid ${theme.border}`,borderTop:`3px solid ${c}`}}>
+                  <p style={{fontSize:22,fontWeight:700,color:c,fontFamily:"'Playfair Display',serif"}}>{v}</p>
+                  <p style={{fontSize:11,fontWeight:600,color:theme.textMuted,textTransform:"uppercase"}}>{l}</p>
+                </div>
+              ))}
+            </div>
+          )}
+          {attLoading&&<div style={{textAlign:"center",padding:24}}><span className="spinner spinner-dark"/></div>}
+          {attendance.length>0&&(
+            <div style={{border:`1px solid ${theme.border}`,borderRadius:10,overflow:"hidden",maxHeight:300,overflowY:"auto"}}>
+              {attendance.map((a,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 14px",borderBottom:`1px solid ${theme.border}`,background:a.status==="Absent"?"#FEF2F2":"white"}}>
+                  <span style={{fontSize:13,fontWeight:500}}>{a.date?.split("T")[0]||"—"}</span>
+                  <Badge color={a.status==="Present"?"green":"red"}>{a.status}</Badge>
+                  {a.remarks&&<span style={{fontSize:11,color:theme.textMuted}}>{a.remarks}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+          {!attLoading&&attendance.length===0&&(
+            <div style={{padding:24,textAlign:"center",color:theme.textMuted,fontSize:13}}>No attendance records found.</div>
+          )}
+        </div>
+      )}
+
+      {/* PERSONAL INFO TAB */}
+      {profileTab==="info"&&(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          {[
+            ["Date of Birth",   student.date_of_birth?.split("T")[0]||"—"],
+            ["Gender",          student.gender||"—"],
+            ["Email",           student.email||"—"],
+            ["Address",         student.address||"—"],
+            ["Parent/Guardian", student.parent_name||"—"],
+            ["Parent Phone",    student.parent_phone||"—"],
+            ["Enrolled",        student.enroll_date?.split("T")[0]||"—"],
+            ["Campus",          student.campus?.toUpperCase()||"—"],
+          ].map(([l,v])=>(
+            <div key={l} style={{padding:"10px 12px",background:"#FAFAFA",borderRadius:8,fontSize:13}}>
+              <p style={{fontSize:10,fontWeight:600,color:theme.textMuted,textTransform:"uppercase",marginBottom:2}}>{l}</p>
+              <p style={{fontWeight:500}}>{v}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+
 // ─── Students (Learners) ──────────────────────────────────────────────────────
 function Students({user}) {
   const toast=useToast();
@@ -818,6 +1170,7 @@ function Students({user}) {
   const [saving,setSaving]=useState(false);const [formError,setFormError]=useState("");const [form,setForm]=useState({});
   const [createParent,setCreateParent]=useState(false);
   const [parentForm,setParentForm]=useState({username:"",password:"",fullName:""});
+  const [profileId,setProfileId]=useState(null); // student DB id for StudentProfile modal
   const dSearch=useDebounce(search,400);
   const {data,loading,error,reload}=useFetch(
     ()=> !isTeacher ? api.students({search:dSearch,grade:form_filter,page:pg,limit:20}) : Promise.resolve(null),
@@ -948,7 +1301,7 @@ function Students({user}) {
                       <td style={{fontSize:13}}>{s.parent_phone||"—"}</td>
                       <td><Badge color={s.status==="Active"?"green":"gray"}>{s.status}</Badge></td>
                       <td>
-                        <button className="btn" onClick={()=>{setSelected(s);setModal("view");}} style={{background:theme.bg,border:`1px solid ${theme.border}`,borderRadius:6,padding:"4px 10px",fontSize:12,cursor:"pointer",fontWeight:500}}>View</button>
+                        <button className="btn" onClick={()=>setProfileId(s.id)} style={{background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:6,padding:"4px 10px",fontSize:12,cursor:"pointer",fontWeight:600,color:"#1D4ED8"}}>View Profile</button>
                       </td>
                     </tr>
                   ))}</tbody>
@@ -958,27 +1311,8 @@ function Students({user}) {
           </div>
         ))}
 
-        {/* View modal (read-only for teachers) */}
-        {modal==="view" && selected && (
-          <Modal title="Learner Details" onClose={()=>setModal(null)}>
-            <div style={{display:"flex",gap:16,alignItems:"center",padding:20,background:"#FEF2F2",borderRadius:12,marginBottom:20,borderLeft:`4px solid ${theme.red}`}}>
-              <div style={{width:52,height:52,borderRadius:"50%",background:`linear-gradient(135deg,${theme.red},${theme.turquoise})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:700,color:"white"}}>{selected.first_name[0]}{selected.last_name[0]}</div>
-              <div>
-                <h3 style={{fontWeight:700,fontSize:16,fontFamily:"'Playfair Display',serif"}}>{selected.last_name}, {selected.first_name}</h3>
-                <p style={{fontSize:13,color:theme.textMuted}}>{selected.student_id} · {FORM_LABEL[selected.grade||selected.form]||selected.grade} · {selected.class}</p>
-                <Badge color={selected.status==="Active"?"green":"gray"}>{selected.status}</Badge>
-              </div>
-            </div>
-            {[["Gender",selected.gender],["Parent/Guardian",selected.parent_name],["Parent Phone",selected.parent_phone],["Status",selected.status]].map(([l,v])=>(
-              <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:`1px solid ${theme.border}`,fontSize:13}}>
-                <span style={{color:theme.textMuted,fontWeight:600}}>{l}</span><span style={{fontWeight:500}}>{v||"—"}</span>
-              </div>
-            ))}
-            <div style={{marginTop:14}}>
-              <Btn size="sm" icon="download" variant="tq" onClick={()=>window.open(api.reportCardURL(selected.id,{term:"Term 1",year:CURRENT_YEAR,report_type:"term_report"}),"_blank")}>View Report Card</Btn>
-            </div>
-          </Modal>
-        )}
+        {/* Student Profile modal */}
+        {profileId && <StudentProfile studentId={profileId} user={user} onClose={()=>setProfileId(null)}/>}
       </div>
     );
   }
@@ -1019,7 +1353,7 @@ function Students({user}) {
                   <td style={{fontSize:13}}>{s.parent_phone}</td>
                   <td><Badge color={s.status==="Active"?"green":s.status==="Graduated"?"purple":"gray"}>{s.status}</Badge></td>
                   <td><div style={{display:"flex",gap:5}}>
-                    <button className="btn" onClick={()=>{setSelected(s);setModal("view");}} style={{background:theme.bg,border:`1px solid ${theme.border}`,borderRadius:6,padding:"4px 10px",fontSize:12,cursor:"pointer",fontWeight:500}}>View</button>
+                    <button className="btn" onClick={()=>setProfileId(s.id)} style={{background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:6,padding:"4px 10px",fontSize:12,cursor:"pointer",fontWeight:600,color:"#1D4ED8"}}>View Profile</button>
                     {canEdit&&<button className="btn" onClick={()=>openEdit(s)} style={{background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:6,padding:"4px 10px",fontSize:12,cursor:"pointer",fontWeight:500,color:"#1D4ED8"}}>Edit</button>}
                     {canDelete&&<button className="btn" onClick={()=>handleDelete(s.id)} style={{background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:6,padding:"4px 10px",fontSize:12,cursor:"pointer",fontWeight:500,color:theme.danger}}>Del</button>}
                   </div></td>
@@ -1037,30 +1371,12 @@ function Students({user}) {
         )}
       </div>
 
-      {modal&&(
-        <Modal title={modal==="view"?"Learner Details":modal==="edit"?"Edit Learner":"Enrol New Learner"} onClose={()=>setModal(null)}>
-          {modal==="view"&&selected?(
-            <div>
-              <div style={{display:"flex",gap:16,alignItems:"center",padding:20,background:"#FEF2F2",borderRadius:12,marginBottom:20,borderLeft:`4px solid ${theme.red}`}}>
-                <div style={{width:52,height:52,borderRadius:"50%",background:`linear-gradient(135deg,${theme.red},${theme.turquoise})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:700,color:"white"}}>{selected.first_name[0]}{selected.last_name[0]}</div>
-                <div>
-                  <h3 style={{fontWeight:700,fontSize:16,fontFamily:"'Playfair Display',serif"}}>{selected.last_name}, {selected.first_name}</h3>
-                  <p style={{fontSize:13,color:theme.textMuted}}>{selected.student_id} · {FORM_LABEL[selected.grade]||selected.grade} · {selected.class}</p>
-                  <Badge color={selected.status==="Active"?"green":selected.status==="Graduated"?"purple":"gray"}>{selected.status}</Badge>
-                </div>
-              </div>
-              {[["Date of Birth",selected.date_of_birth?.split("T")[0]],["Gender",selected.gender],["Email",selected.email],["Phone",selected.phone],["Address",selected.address],["Parent/Guardian",selected.parent_name],["Parent Phone",selected.parent_phone],["Enrolled",selected.enroll_date?.split("T")[0]]].map(([l,v])=>(
-                <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:`1px solid ${theme.border}`,fontSize:13}}>
-                  <span style={{color:theme.textMuted,fontWeight:600}}>{l}</span><span style={{fontWeight:500}}>{v||"—"}</span>
-                </div>
-              ))}
-              <div style={{display:"flex",gap:8,marginTop:16,flexWrap:"wrap"}}>
-                <Btn size="sm" icon="download" variant="tq" onClick={()=>window.open(api.reportCardURL(selected.id,{term:"Term 1",year:CURRENT_YEAR,report_type:"term_report"}),"_blank")}>Term Report PDF</Btn>
-                <Btn size="sm" icon="download" variant="secondary" onClick={()=>window.open(api.reportCardURL(selected.id,{term:"Term 1",year:CURRENT_YEAR,report_type:"mark_reader"}),"_blank")}>Mark Reader PDF</Btn>
-              </div>
-            </div>
-          ):(
-            <>
+      {/* Student Profile modal for admin/principal */}
+      {profileId && <StudentProfile studentId={profileId} user={user} onClose={()=>setProfileId(null)}/>}
+
+      {modal&&modal!=="view"&&(
+        <Modal title={modal==="edit"?"Edit Learner":"Enrol New Learner"} onClose={()=>setModal(null)}>
+          <>
               {formError&&<div style={{background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:8,padding:"10px 14px",marginBottom:16,fontSize:13,color:theme.danger}}>{formError}</div>}
               <div className="form-row">
                 <div className="form-group"><label>Surname *</label><input className="form-input" value={form.lastName||""} onChange={f("lastName")}/></div>
@@ -1112,7 +1428,6 @@ function Students({user}) {
                 <Btn variant="secondary" onClick={()=>setModal(null)}>Cancel</Btn>
               </div>
             </>
-          )}
         </Modal>
       )}
     </div>
@@ -1157,297 +1472,393 @@ const EFFORT_LABEL = {4:"Excellent",3:"Good",2:"Satisfactory",1:"Can Improve",0:
 // ─── Results ──────────────────────────────────────────────────────────────────
 function Results({user}) {
   const toast = useToast();
-  const [reportType, setReportType] = useState("term_report"); // term_report | mark_reader
-  const [term,  setTerm]  = useState("Term 1");
-  const [year,  setYear]  = useState(CURRENT_YEAR.toString());
-  const [formF, setFormF] = useState("");
-  const [search,setSearch]= useState("");
-  const [modal, setModal] = useState(null);
-  const [saving,setSaving]= useState(false);
-  const [form,  setForm]  = useState({});
-  const [showGrading, setShowGrading] = useState(false);
+  const isTeacher = user.role === "teacher";
 
-  const {data,loading,error,reload} = useFetch(
-    ()=>api.results({term, year, grade:formF, report_type:reportType, limit:80}),
-    [term, year, formF, reportType]
-  );
-  const {data:subjData} = useFetch(()=>api.subjects(form.formForSubject ? {form:form.formForSubject} : {}), [form.formForSubject]);
-  const subjects = subjData?.subjects || [];
-
-  const results = (data?.results||[]).filter(r=>
-    search===""||`${r.first_name} ${r.last_name}`.toLowerCase().includes(search.toLowerCase())
-  );
-
-  const canEdit = ["admin","teacher"].includes(user.role);
+  // ── Shared state ──────────────────────────────────────────────────────────
+  const [tab,        setTab]        = useState("class");   // "class" | "enter"
+  const [term,       setTerm]       = useState("Term 1");
+  const [year,       setYear]       = useState(CURRENT_YEAR.toString());
+  const [reportType, setReportType] = useState("term_report");
+  const [formFilter, setFormFilter] = useState("");
+  const [subjectFilter,setSubjectFilter] = useState("");
+  const [profileId,  setProfileId]  = useState(null);
+  const [modal,      setModal]      = useState(null);
+  const [saving,     setSaving]     = useState(false);
+  const [form,       setForm]       = useState({severity:"Low"});
+  const [subjects,   setSubjects]   = useState([]);
   const f = k => e => setForm(p=>({...p,[k]:e.target.value}));
 
-  const handleSave = async () => {
-    if (!form.studentId || !form.subjectId || !form.mark) {
-      toast("Learner ID, subject and mark are required","error"); return;
-    }
+  const canEnter = ["admin","teacher","principal"].includes(user.role);
+
+  // ── Teacher: load their subject assignments ───────────────────────────────
+  const {data:myAssignData} = useFetch(
+    ()=> isTeacher ? api.teacherSubjects(user.id) : Promise.resolve(null), []
+  );
+  const myAssignments = myAssignData?.assignments || [];
+  // Unique forms teacher is assigned to
+  const myForms = [...new Set(myAssignments.map(a=>a.form))];
+  // Unique subjects teacher is assigned to
+  const mySubjects = myAssignments.reduce((acc,a)=>{
+    if (!acc.find(s=>s.subject_id===a.subject_id)) acc.push(a);
+    return acc;
+  },[]);
+
+  // ── Class results: fetch for selected form+subject+term ───────────────────
+  const effectiveForm    = formFilter || (isTeacher ? myForms[0] : "");
+  const effectiveSubject = subjectFilter || (isTeacher ? mySubjects[0]?.subject_id : "");
+
+  const {data:classData, loading:classLoading, reload:reloadClass} = useFetch(()=>{
+    if (!effectiveForm) return Promise.resolve({results:[]});
+    const q = {term, year, report_type:reportType};
+    if (effectiveSubject) q.subject_id = effectiveSubject;
+    return api.classResults(effectiveForm, q);
+  }, [effectiveForm, effectiveSubject, term, year, reportType]);
+  const classResults = classData?.results || [];
+
+  // Group by student for class view
+  const byStudent = classResults.reduce((acc,r)=>{
+    const key = r.student_db_id || r.student_id;
+    if (!acc[key]) acc[key] = {
+      id: r.student_db_id, student_id: r.student_id,
+      first_name: r.first_name, last_name: r.last_name,
+      grade: r.student_grade, class: r.class, gender: r.gender,
+      results: []
+    };
+    acc[key].results.push(r);
+    return acc;
+  },{});
+  const studentRows = Object.values(byStudent);
+
+  // ── Admin/Principal: full results list ────────────────────────────────────
+  const [search, setSearch] = useState("");
+  const dSearch = useDebounce(search, 400);
+  const {data:allData, loading:allLoading, reload:reloadAll} = useFetch(()=>{
+    if (isTeacher) return Promise.resolve(null);
+    const q = {};
+    if (term)          q.term        = term;
+    if (year)          q.year        = year;
+    if (reportType)    q.report_type = reportType;
+    if (formFilter)    q.grade       = formFilter;
+    if (dSearch)       q.search      = dSearch;
+    q.limit = 100;
+    return api.results(q);
+  }, [term, year, reportType, formFilter, dSearch, isTeacher]);
+  const allResults = allData?.results || [];
+
+  // ── Load subjects for add-result form ────────────────────────────────────
+  React.useEffect(()=>{
+    const frm = form.formForSubject;
+    if (!frm) { setSubjects([]); return; }
+    api.allSubjectsForForm(frm)
+      .then(d=>setSubjects(d.subjects||[]))
+      .catch(()=>setSubjects([]));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[form.formForSubject]);
+
+  const handleSaveResult = async () => {
+    if (!form.studentId)     { toast("Select a learner","warning"); return; }
+    if (!form.subjectId)     { toast("Select a subject","warning"); return; }
+    if (!form.mark && form.mark!==0) { toast("Enter a mark","warning"); return; }
     setSaving(true);
     try {
       await api.saveResult({
-        studentId: form.studentId,
-        subjectId: form.subjectId,
-        term, year: parseInt(year),
-        report_type: reportType,
-        mark: parseFloat(form.mark),
-        effort: form.effort ? parseInt(form.effort) : undefined,
-        class_average: form.classAverage ? parseFloat(form.classAverage) : undefined,
-        remarks: form.remarks,
+        student_id:   form.studentId,
+        subject_id:   parseInt(form.subjectId),
+        term,
+        year:         parseInt(year),
+        report_type:  reportType,
+        mark:         parseFloat(form.mark),
+        effort:       form.effort||null,
+        class_average:form.classAvg?parseFloat(form.classAvg):null,
+        remarks:      form.remarks||null,
       });
-      toast(reportType==="mark_reader" ? "Mark Reader entry saved" : "Result saved");
-      setModal(null); reload();
-    } catch(e) { toast(e.message,"error"); }
+      toast("Result saved ✅");
+      setModal(null);
+      setForm({severity:"Low"});
+      reloadClass(); reloadAll();
+    } catch(e){ toast(e.message,"error"); }
     finally { setSaving(false); }
   };
 
-  const handleDelete = async id => {
-    if (!window.confirm("Delete this result?")) return;
-    try { await api.deleteResult(id); toast("Result deleted","info"); reload(); }
-    catch(e) { toast(e.message,"error"); }
+  const openAdd = () => {
+    // Pre-fill form+subject for teachers
+    const preForm = isTeacher ? (myForms[0]||"") : "";
+    const preSub  = isTeacher ? (mySubjects[0]?.subject_id?.toString()||"") : "";
+    setForm({formForSubject:preForm, subjectId:preSub, severity:"Low"});
+    setModal("add");
   };
 
-  // Grade preview when typing mark
-  const selectedSubj = subjects.find(s=>String(s.id)===String(form.subjectId));
-  const gradePreview = form.mark ? previewGrade(form.mark, selectedSubj?.curriculum||"ZIMSEC_O") : null;
-
-  const summary = {
-    A:    results.filter(r=>["A","A*"].includes(r.grade)).length,
-    B:    results.filter(r=>r.grade==="B").length,
-    C:    results.filter(r=>r.grade==="C").length,
-    fail: results.filter(r=>["D","E","U","F","G"].includes(r.grade)).length,
-  };
-
+  // ─── RENDER ───────────────────────────────────────────────────────────────
   return (
     <div>
       {/* Header */}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
         <div>
-          <h2 style={{fontSize:20,fontWeight:700,fontFamily:"'Playfair Display',serif"}}>Results & Marks</h2>
-          <p style={{fontSize:12,color:theme.textMuted}}>ZIMSEC O-Level · ZIMSEC A-Level · Cambridge</p>
+          <h2 style={{fontSize:20,fontWeight:700,fontFamily:"'Playfair Display',serif"}}>Results</h2>
+          <p style={{fontSize:13,color:theme.textMuted}}>
+            {isTeacher ? `Your classes · ${myForms.length} form${myForms.length!==1?"s":""} assigned` : "All learner results · "+SCHOOL.name}
+          </p>
         </div>
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={()=>setShowGrading(s=>!s)} style={{padding:"7px 14px",borderRadius:8,border:`1px solid ${theme.border}`,background:showGrading?theme.turquoise:"white",color:showGrading?"white":theme.textMuted,fontSize:12,fontWeight:600,cursor:"pointer"}}>
-            Grade Scale
-          </button>
-          <Btn variant="secondary" size="sm" icon="download" onClick={()=>exportCSV(
-            results.map(r=>({Learner:`${r.last_name} ${r.first_name}`,Form:r.student_grade,Subject:r.subject_name,Mark:r.mark||r.total,Grade:r.grade,Effort:r.effort||"",ClassAvg:r.class_average||"",Term:r.term,Year:r.year,Type:r.report_type})),
-            `results-${reportType}-${term}-${year}.csv`
-          )}>Export</Btn>
-          {canEdit&&<Btn icon="plus" onClick={()=>{setForm({term,year:CURRENT_YEAR,mark:""});setModal("add");}}>
-            {reportType==="mark_reader"?"Add Mark Reader":"Add Result"}
-          </Btn>}
-        </div>
-      </div>
-
-      {/* Grading scale reference */}
-      {showGrading&&(
-        <div style={{background:"white",borderRadius:12,padding:20,marginBottom:16,border:`1px solid ${theme.border}`,boxShadow:"0 2px 8px rgba(196,30,58,0.06)"}}>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:20}}>
-            {[
-              {label:"ZIMSEC O-Level",grades:[{g:"A",r:"Distinction",range:"75–100%"},{g:"B",r:"Merit",range:"65–74%"},{g:"C",r:"Credit",range:"50–64%"},{g:"D",r:"Satisfactory",range:"40–49%"},{g:"E",r:"Fail",range:"30–39%"},{g:"U",r:"Unclassified",range:"Below 30%"}]},
-              {label:"ZIMSEC A-Level",grades:[{g:"A",r:"Excellent",range:"80–100%"},{g:"B",r:"Very Good",range:"70–79%"},{g:"C",r:"Good",range:"60–69%"},{g:"D",r:"Satisfactory",range:"50–59%"},{g:"E",r:"Pass",range:"40–49%"},{g:"F",r:"Fail",range:"Below 40%"}]},
-              {label:"Cambridge",grades:[{g:"A*",r:"Outstanding",range:"90–100%"},{g:"A",r:"Excellent",range:"80–89%"},{g:"B",r:"Very Good",range:"70–79%"},{g:"C",r:"Good",range:"60–69%"},{g:"D",r:"Satisfactory",range:"50–59%"},{g:"E",r:"Pass",range:"40–49%"},{g:"U",r:"Ungraded",range:"0–39%"}]},
-            ].map(({label,grades})=>(
-              <div key={label}>
-                <p style={{fontSize:12,fontWeight:700,color:theme.red,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:8}}>{label}</p>
-                {grades.map(({g,r,range})=>(
-                  <div key={g} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:`1px solid ${theme.border}`,fontSize:12}}>
-                    <span className="badge" style={{background:`${GRADE_COLOR[g]||"#64748B"}20`,color:GRADE_COLOR[g]||"#64748B",fontWeight:700,padding:"1px 8px"}}>{g}</span>
-                    <span style={{color:theme.textMuted}}>{r}</span>
-                    <span style={{fontWeight:600}}>{range}</span>
-                  </div>
-                ))}
-              </div>
-            ))}
-          </div>
-          <div style={{marginTop:12,padding:10,background:"#FEF3C7",borderRadius:8,fontSize:12,color:"#92400E"}}>
-            <strong>Effort symbols (Mark Reader only):</strong> 4=Excellent · 3=Good · 2=Satisfactory · 1=Can Improve · 0=Poor · -1=Unacceptable
-          </div>
-        </div>
-      )}
-
-      {error&&<ErrorBox message={error} onRetry={reload}/>}
-
-      {/* Report type tabs */}
-      <div style={{display:"flex",gap:8,marginBottom:16}}>
-        {[["term_report","📋 Full Term Report","End of term exam marks"],["mark_reader","📊 Half Term Mark Reader","Mid-term continuous assessment"]].map(([id,label,desc])=>(
-          <div key={id} onClick={()=>setReportType(id)} style={{flex:1,padding:"12px 16px",borderRadius:12,border:`2px solid ${reportType===id?theme.red:theme.border}`,background:reportType===id?"#FEF2F2":"white",cursor:"pointer",transition:"all 0.15s"}}>
-            <p style={{fontWeight:700,fontSize:13,color:reportType===id?theme.red:theme.text}}>{label}</p>
-            <p style={{fontSize:11,color:theme.textMuted,marginTop:2}}>{desc}</p>
-          </div>
-        ))}
-      </div>
-
-      {/* Summary cards - term report only */}
-      {reportType==="term_report"&&(
-        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
-          {[["A / A*","Distinction",theme.green,summary.A],["B","Merit",theme.turquoise,summary.B],["C","Credit",theme.amber,summary.C],["D–U","Needs Support",theme.danger,summary.fail]].map(([g,l,c,v])=>(
-            <div key={g} style={{background:"white",borderRadius:12,padding:14,boxShadow:"0 2px 8px rgba(196,30,58,0.06)",border:`1px solid ${theme.border}`,borderTop:`3px solid ${c}`}}>
-              <p style={{fontSize:20,fontWeight:700,color:c,fontFamily:"'Playfair Display',serif"}}>{loading?"…":v}</p>
-              <p style={{fontSize:11,fontWeight:600,color:theme.text}}>{l} <span style={{color:theme.textMuted}}>({g})</span></p>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Results table */}
-      <div style={{background:"white",borderRadius:14,boxShadow:"0 2px 8px rgba(196,30,58,0.06)",border:`1px solid ${theme.border}`,overflow:"hidden"}}>
-        <div style={{padding:14,borderBottom:`1px solid ${theme.border}`,display:"flex",gap:10,flexWrap:"wrap"}}>
-          <div style={{flex:1,minWidth:180}}><SearchInput value={search} onChange={setSearch} placeholder="Search learner..."/></div>
-          <select className="form-input" style={{width:110}} value={term} onChange={e=>setTerm(e.target.value)}>{TERMS.map(t=><option key={t}>{t}</option>)}</select>
-          <select className="form-input" style={{width:96}} value={year} onChange={e=>setYear(e.target.value)}><option>{CURRENT_YEAR}</option><option>{CURRENT_YEAR-1}</option></select>
-          <select className="form-input" style={{width:160}} value={formF} onChange={e=>setFormF(e.target.value)}>
-            <option value="">All Forms</option>
-            {FORMS.map(fm=><option key={fm} value={fm}>{FORM_LABEL[fm]}</option>)}
-          </select>
-        </div>
-
-        {loading ? <div style={{padding:24}}>{[...Array(6)].map((_,i)=><div key={i} className="skeleton" style={{height:48,marginBottom:8}}/>)}</div>
-        : results.length===0 ? <EmptyState message={`No ${reportType==="mark_reader"?"Mark Reader":"Term Report"} entries found`}/>
-        : (
-          <div style={{overflowX:"auto"}}>
-            <table>
-              {reportType==="term_report"?(
-                <thead><tr style={{background:"#FEF2F2"}}>
-                  <th>Learner</th><th>Form</th><th>Subject</th><th>Curriculum</th><th>Mark %</th><th>Grade</th><th>Remarks</th>
-                  {canEdit&&<th>Action</th>}
-                </tr></thead>
-              ):(
-                <thead><tr style={{background:"#FEF2F2"}}>
-                  <th>Learner</th><th>Form</th><th>Subject</th><th>Mark %</th><th>Class Avg</th><th>Effort</th><th>Grade</th>
-                  {canEdit&&<th>Action</th>}
-                </tr></thead>
-              )}
-              <tbody>
-                {results.map((r,i)=>(
-                  <tr key={i}>
-                    <td>
-                      <div style={{display:"flex",alignItems:"center",gap:8}}>
-                        <div style={{width:28,height:28,borderRadius:"50%",background:`linear-gradient(135deg,${theme.red},${theme.turquoise})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:"white",flexShrink:0}}>
-                          {r.first_name[0]}{r.last_name[0]}
-                        </div>
-                        <span style={{fontSize:13,fontWeight:500}}>{r.last_name}, {r.first_name}</span>
-                      </div>
-                    </td>
-                    <td><Badge color="tq">{FORM_LABEL[r.student_grade]||r.student_grade}</Badge></td>
-                    <td style={{fontSize:13}}>{r.subject_name}</td>
-                    {reportType==="term_report"&&(
-                      <td><span style={{fontSize:11,padding:"2px 8px",borderRadius:4,background:theme.bg,color:theme.textMuted,fontWeight:600}}>{r.curriculum?.replace("_"," ")}</span></td>
-                    )}
-                    <td style={{fontWeight:700,fontSize:14}}>{parseFloat(r.mark||r.total||0).toFixed(0)}%</td>
-                    {reportType==="mark_reader"&&(
-                      <td style={{fontSize:13,color:theme.textMuted}}>{r.class_average?`${parseFloat(r.class_average).toFixed(0)}%`:"—"}</td>
-                    )}
-                    {reportType==="mark_reader"&&(
-                      <td>
-                        {r.effort!=null?(
-                          <span style={{fontSize:12,fontWeight:600,color:r.effort>=3?theme.green:r.effort>=1?theme.amber:theme.danger}}>
-                            {r.effort} — {EFFORT_LABEL[r.effort]||""}
-                          </span>
-                        ):"—"}
-                      </td>
-                    )}
-                    <td>
-                      <span className="badge" style={{background:`${GRADE_COLOR[r.grade]||"#64748B"}20`,color:GRADE_COLOR[r.grade]||"#64748B",fontWeight:700,fontSize:13}}>
-                        {r.grade}
-                      </span>
-                    </td>
-                    {canEdit&&(
-                      <td>
-                        <button className="btn" onClick={()=>handleDelete(r.id)}
-                          style={{background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:6,padding:"4px 10px",fontSize:12,cursor:"pointer",color:theme.danger,fontWeight:500}}>
-                          Del
-                        </button>
-                      </td>
-                    )}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        {canEnter && (
+          <Btn icon="plus" onClick={openAdd}>Add Result</Btn>
         )}
       </div>
 
-      {/* Add Result Modal */}
-      {modal==="add"&&(
-        <Modal title={reportType==="mark_reader"?"Add Mark Reader Entry":"Add Term Report Result"} onClose={()=>setModal(null)}>
-          <div style={{padding:12,background:"#FEF2F2",borderRadius:8,marginBottom:16,fontSize:12,color:theme.red,borderLeft:`3px solid ${theme.red}`}}>
-            {reportType==="mark_reader"
-              ? "Half-term entry: enter the learner's percentage, effort rating, and class average."
-              : "End-of-term entry: enter the learner's final examination mark. Grade is auto-calculated."}
+      {/* Filters bar */}
+      <div style={{background:"white",borderRadius:14,border:`1px solid ${theme.border}`,padding:14,marginBottom:16,display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+        <select className="form-input" style={{width:120}} value={term} onChange={e=>setTerm(e.target.value)}>
+          {TERMS.map(t=><option key={t}>{t}</option>)}
+        </select>
+        <select className="form-input" style={{width:110}} value={year} onChange={e=>setYear(e.target.value)}>
+          {[2026,2025,2024].map(y=><option key={y}>{y}</option>)}
+        </select>
+        <select className="form-input" style={{width:150}} value={formFilter} onChange={e=>setFormFilter(e.target.value)}>
+          <option value="">{isTeacher?"— My Forms —":"All Forms"}</option>
+          {(isTeacher ? myForms : FORMS).map(fm=><option key={fm} value={fm}>{FORM_LABEL[fm]||fm}</option>)}
+        </select>
+        {isTeacher && mySubjects.length > 0 && (
+          <select className="form-input" style={{width:200}} value={subjectFilter} onChange={e=>setSubjectFilter(e.target.value)}>
+            <option value="">— All My Subjects —</option>
+            {mySubjects.map(s=><option key={s.subject_id} value={s.subject_id}>{s.subject_name}</option>)}
+          </select>
+        )}
+        <div style={{display:"flex",gap:6}}>
+          {[["term_report","Term Report"],["mark_reader","Mark Reader"]].map(([id,lbl])=>(
+            <button key={id} onClick={()=>setReportType(id)}
+              style={{padding:"6px 12px",borderRadius:8,border:`1.5px solid ${reportType===id?theme.red:theme.border}`,background:reportType===id?"#FEF2F2":"white",color:reportType===id?theme.red:theme.textMuted,fontSize:12,fontWeight:600,cursor:"pointer"}}>
+              {lbl}
+            </button>
+          ))}
+        </div>
+        {!isTeacher && (
+          <div style={{flex:1,minWidth:180}}>
+            <SearchInput value={search} onChange={setSearch} placeholder="Search learner..."/>
           </div>
+        )}
+        <Btn variant="secondary" size="sm" icon="download"
+          onClick={()=>exportCSV((isTeacher?classResults:allResults).map(r=>({
+            Learner:`${r.last_name} ${r.first_name}`, Form:r.student_grade||r.grade,
+            Subject:r.subject_name, Term:r.term, Year:r.year,
+            Mark:r.mark, Grade:r.grade, Remarks:r.remarks
+          })),"results.csv")}>
+          Export
+        </Btn>
+      </div>
 
-          <div className="form-row">
-            <div className="form-group"><label>Learner ID *</label>
-              <input className="form-input" placeholder="e.g. 0001" value={form.studentId||""} onChange={f("studentId")}/>
-            </div>
-            <div className="form-group"><label>Form (for subject list)</label>
-              <select className="form-input" value={form.formForSubject||""} onChange={e=>setForm(p=>({...p,formForSubject:e.target.value,subjectId:""}))}>
-                <option value="">Select form first</option>
-                {FORMS.map(fm=><option key={fm} value={fm}>{FORM_LABEL[fm]}</option>)}
-              </select>
-            </div>
-          </div>
+      {/* ── TEACHER: Class view grouped by student ── */}
+      {isTeacher && (
+        <div>
+          {classLoading && <div style={{padding:32,textAlign:"center"}}><span className="spinner spinner-dark"/></div>}
 
-          <div className="form-group"><label>Subject *</label>
-            <select className="form-input" value={form.subjectId||""} onChange={f("subjectId")}>
-              <option value="">— Select subject —</option>
-              {subjects.map(s=>(
-                <option key={s.id} value={s.id}>{s.name} ({s.curriculum.replace("_"," ")})</option>
-              ))}
-            </select>
-          </div>
-
-          <div className="form-row">
-            <div className="form-group"><label>Mark % *</label>
-              <input type="number" min="0" max="100" step="0.5" className="form-input"
-                placeholder="0 – 100" value={form.mark||""} onChange={f("mark")}/>
-            </div>
-            <div className="form-group"><label>Term</label>
-              <select className="form-input" value={form.term||term} onChange={f("term")}>
-                {TERMS.map(t=><option key={t}>{t}</option>)}
-              </select>
-            </div>
-          </div>
-
-          {/* Grade preview */}
-          {gradePreview&&(
-            <div style={{padding:"10px 14px",background:`${GRADE_COLOR[gradePreview.g]||"#64748B"}15`,borderRadius:8,marginBottom:12,display:"flex",alignItems:"center",gap:12}}>
-              <span className="badge" style={{background:`${GRADE_COLOR[gradePreview.g]}25`,color:GRADE_COLOR[gradePreview.g],fontWeight:700,fontSize:16,padding:"4px 12px"}}>{gradePreview.g}</span>
-              <div>
-                <p style={{fontSize:13,fontWeight:600,color:GRADE_COLOR[gradePreview.g]}}>{gradePreview.r}</p>
-                <p style={{fontSize:11,color:theme.textMuted}}>Auto-calculated · {selectedSubj?.curriculum?.replace("_"," ")}</p>
-              </div>
+          {!classLoading && studentRows.length===0 && (
+            <div style={{background:"white",borderRadius:14,border:`1px solid ${theme.border}`,padding:48,textAlign:"center"}}>
+              <p style={{fontSize:16,fontWeight:700,marginBottom:8,color:theme.textMuted}}>No results for this selection</p>
+              <p style={{fontSize:13,color:theme.textMuted}}>
+                {!effectiveForm ? "Select a form above" : "No results entered yet for "+FORM_LABEL[effectiveForm]+" · "+term+" "+year}
+              </p>
+              {canEnter && <div style={{marginTop:16}}><Btn onClick={openAdd} icon="plus">Add First Result</Btn></div>}
             </div>
           )}
 
-          {/* Mark Reader extra fields */}
-          {reportType==="mark_reader"&&(
-            <div className="form-row">
-              <div className="form-group"><label>Effort (−1 to 4)</label>
-                <select className="form-input" value={form.effort??""} onChange={f("effort")}>
-                  <option value="">Select</option>
-                  {Object.entries(EFFORT_LABEL).map(([k,v])=>(
-                    <option key={k} value={k}>{k} — {v}</option>
+          {studentRows.length > 0 && (
+            <div style={{background:"white",borderRadius:14,border:`1px solid ${theme.border}`,overflow:"hidden",boxShadow:"0 2px 8px rgba(196,30,58,0.06)"}}>
+              <div style={{padding:"12px 16px",borderBottom:`1px solid ${theme.border}`,background:"#FEF2F2",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <p style={{fontWeight:700,fontSize:14,color:theme.red}}>
+                  {FORM_LABEL[effectiveForm]||effectiveForm} — {term} {year}
+                  {effectiveSubject && mySubjects.find(s=>String(s.subject_id)===String(effectiveSubject))
+                    ? " · "+mySubjects.find(s=>String(s.subject_id)===String(effectiveSubject))?.subject_name
+                    : ""}
+                </p>
+                <Badge color="tq">{studentRows.length} learners</Badge>
+              </div>
+              <table>
+                <thead><tr style={{background:"#FAFAFA"}}>
+                  <th>Learner</th><th>Gender</th>
+                  {mySubjects.slice(0,4).map(s=><th key={s.subject_id} style={{fontSize:11}}>{s.subject_name?.split(" ")[0]}</th>)}
+                  <th>Actions</th>
+                </tr></thead>
+                <tbody>
+                  {studentRows.map(s=>(
+                    <tr key={s.id}>
+                      <td>
+                        <div style={{display:"flex",alignItems:"center",gap:8}}>
+                          <div style={{width:30,height:30,borderRadius:"50%",background:`linear-gradient(135deg,${theme.red},${theme.turquoise})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:"white",flexShrink:0}}>
+                            {s.first_name[0]}{s.last_name[0]}
+                          </div>
+                          <div>
+                            <p style={{fontWeight:600,fontSize:13}}>{s.last_name}, {s.first_name}</p>
+                            <p style={{fontSize:11,color:theme.turquoise,fontFamily:"monospace"}}>{s.student_id}</p>
+                          </div>
+                        </div>
+                      </td>
+                      <td style={{fontSize:12,color:theme.textMuted}}>{s.gender}</td>
+                      {mySubjects.slice(0,4).map(sub=>{
+                        const r = s.results.find(r=>String(r.subject_id)===String(sub.subject_id));
+                        return (
+                          <td key={sub.subject_id}>
+                            {r ? (
+                              <div style={{textAlign:"center"}}>
+                                <span className="badge" style={{background:`${GRADE_COLOR[r.grade]||"#64748B"}20`,color:GRADE_COLOR[r.grade]||"#64748B",fontWeight:700,fontSize:13}}>{r.grade}</span>
+                                <p style={{fontSize:10,color:theme.textMuted,marginTop:1}}>{parseFloat(r.mark||0).toFixed(0)}%</p>
+                              </div>
+                            ) : <span style={{color:theme.border,fontSize:12}}>—</span>}
+                          </td>
+                        );
+                      })}
+                      <td>
+                        <button onClick={()=>setProfileId(s.id)}
+                          style={{background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:6,padding:"4px 12px",fontSize:12,cursor:"pointer",fontWeight:600,color:"#1D4ED8"}}>
+                          Full Profile
+                        </button>
+                      </td>
+                    </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── ADMIN/PRINCIPAL: full results table ── */}
+      {!isTeacher && (
+        <div style={{background:"white",borderRadius:14,border:`1px solid ${theme.border}`,overflow:"hidden",boxShadow:"0 2px 8px rgba(196,30,58,0.06)"}}>
+          {allLoading ? (
+            <div style={{padding:24}}>{[...Array(4)].map((_,i)=><div key={i} className="skeleton" style={{height:48,marginBottom:8}}/>)}</div>
+          ) : allResults.length===0 ? (
+            <EmptyState message="No results found for this selection"/>
+          ) : (
+            <div style={{overflowX:"auto"}}>
+              <table>
+                <thead><tr style={{background:"#FEF2F2"}}>
+                  <th>Learner</th><th>Form</th><th>Subject</th><th>Term</th><th>Type</th><th>Mark</th><th>Grade</th><th>Remarks</th><th></th>
+                </tr></thead>
+                <tbody>
+                  {allResults.map(r=>(
+                    <tr key={r.id}>
+                      <td>
+                        <p style={{fontWeight:600,fontSize:13}}>{r.last_name}, {r.first_name}</p>
+                        <p style={{fontSize:11,color:theme.turquoise,fontFamily:"monospace"}}>{r.student_id}</p>
+                      </td>
+                      <td><Badge color="tq">{FORM_LABEL[r.grade]||r.grade}</Badge></td>
+                      <td style={{fontSize:12,maxWidth:160}}>
+                        <p style={{fontWeight:500}}>{r.subject_name}</p>
+                        <p style={{fontSize:10,color:theme.textMuted}}>{(r.curriculum||"").replace("_"," ")}</p>
+                      </td>
+                      <td style={{fontSize:12}}>{r.term} {r.year}</td>
+                      <td><Badge color={r.report_type==="mark_reader"?"amber":"tq"}>{r.report_type==="mark_reader"?"MR":"TR"}</Badge></td>
+                      <td style={{fontWeight:700}}>{parseFloat(r.mark||0).toFixed(0)}%</td>
+                      <td><span className="badge" style={{background:`${GRADE_COLOR[r.grade]||"#64748B"}20`,color:GRADE_COLOR[r.grade]||"#64748B",fontWeight:700}}>{r.grade}</span></td>
+                      <td style={{fontSize:11,color:theme.textMuted,maxWidth:140}}>{r.remarks||"—"}</td>
+                      <td>
+                        <button onClick={()=>setProfileId(r.student_db_id||r.studentId)}
+                          style={{background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:6,padding:"3px 10px",fontSize:11,cursor:"pointer",fontWeight:600,color:"#1D4ED8",whiteSpace:"nowrap"}}>
+                          Profile
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Grade scale reference */}
+      <div style={{marginTop:16,padding:14,background:"white",borderRadius:12,border:`1px solid ${theme.border}`}}>
+        <p style={{fontSize:11,fontWeight:700,color:theme.textMuted,textTransform:"uppercase",marginBottom:8}}>Grade Scale Reference</p>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {reportType==="term_report"
+            ? Object.entries(GRADE_COLOR).slice(0,7).map(([g,c])=>(
+                <span key={g} style={{padding:"2px 10px",borderRadius:999,background:`${c}20`,color:c,fontSize:12,fontWeight:700}}>{g}</span>
+              ))
+            : ["A*","A","B","C","D","E","F","G","U"].map(g=>(
+                <span key={g} style={{padding:"2px 10px",borderRadius:999,background:`${GRADE_COLOR[g]||"#64748B"}20`,color:GRADE_COLOR[g]||"#64748B",fontSize:12,fontWeight:700}}>{g}</span>
+              ))
+          }
+        </div>
+      </div>
+
+      {/* Student profile modal */}
+      {profileId && <StudentProfile studentId={profileId} user={user} onClose={()=>setProfileId(null)}/>}
+
+      {/* Add Result modal */}
+      {modal==="add" && (
+        <Modal title="Add Result" onClose={()=>setModal(null)}>
+          <div className="form-group">
+            <label>Learner * <span style={{fontSize:10,color:theme.textMuted}}>(search by name or ID)</span></label>
+            <StudentSearchPicker
+              value={form.selectedStudent||null}
+              onChange={s=>{
+                if(s) setForm(p=>({...p,selectedStudent:s,studentId:s.id,formForSubject:s.form,subjectId:isTeacher&&mySubjects.length===1?mySubjects[0].subject_id.toString():""}));
+                else  setForm(p=>({...p,selectedStudent:null,studentId:"",formForSubject:"",subjectId:""}));
+              }}
+              placeholder="Type name or learner ID..."
+            />
+            {form.selectedStudent&&(
+              <p style={{fontSize:11,color:theme.turquoise,marginTop:4,fontWeight:600}}>
+                ✓ {form.selectedStudent.label} · {FORM_LABEL[form.formForSubject]||form.formForSubject}
+              </p>
+            )}
+          </div>
+
+          <div className="form-group">
+            <label>Subject *</label>
+            {isTeacher ? (
+              <select className="form-input" value={form.subjectId||""} onChange={f("subjectId")}>
+                <option value="">— Select your subject —</option>
+                {mySubjects
+                  .filter(s=>!form.formForSubject || s.form===form.formForSubject)
+                  .map(s=><option key={s.subject_id} value={s.subject_id}>{s.subject_name}</option>)}
+              </select>
+            ) : (
+              <select className="form-input" value={form.subjectId||""} onChange={f("subjectId")} disabled={!form.formForSubject}>
+                <option value="">{!form.formForSubject?"Select learner first":"— Select Subject —"}</option>
+                {subjects.map(s=><option key={s.id} value={s.id}>{s.name} ({(s.curriculum||"").replace("_"," ")})</option>)}
+              </select>
+            )}
+          </div>
+
+          <div className="form-row">
+            <div className="form-group">
+              <label>Mark * (0–100)</label>
+              <input type="number" min="0" max="100" step="0.5" className="form-input"
+                value={form.mark||""} onChange={f("mark")}
+                placeholder="e.g. 78"/>
+              {form.mark && form.subjectId && form.formForSubject && (
+                <p style={{fontSize:11,marginTop:4,fontWeight:700,color:GRADE_COLOR[previewGrade(form.mark,form.formForSubject)]||"#64748B"}}>
+                  Preview grade: {previewGrade(form.mark, form.formForSubject)}
+                </p>
+              )}
+            </div>
+            {reportType==="mark_reader" && (
+              <div className="form-group">
+                <label>Effort</label>
+                <select className="form-input" value={form.effort||""} onChange={f("effort")}>
+                  <option value="">Select</option>
+                  {Object.entries(EFFORT_LABEL).map(([k,v])=><option key={k} value={k}>{v}</option>)}
                 </select>
               </div>
-              <div className="form-group"><label>Class Average %</label>
-                <input type="number" min="0" max="100" className="form-input"
-                  placeholder="e.g. 57" value={form.classAverage||""} onChange={f("classAverage")}/>
-              </div>
+            )}
+          </div>
+
+          {reportType==="mark_reader" && (
+            <div className="form-group">
+              <label>Class Average (%)</label>
+              <input type="number" min="0" max="100" step="0.5" className="form-input"
+                value={form.classAvg||""} onChange={f("classAvg")} placeholder="e.g. 65"/>
             </div>
           )}
 
-          <div className="form-group"><label>Teacher Comments</label>
-            <input className="form-input" placeholder="Optional" value={form.remarks||""} onChange={f("remarks")}/>
+          <div className="form-group">
+            <label>Remarks <span style={{fontSize:10,color:theme.textMuted}}>(optional)</span></label>
+            <input className="form-input" placeholder="e.g. Needs to improve on algebraic manipulation"
+              value={form.remarks||""} onChange={f("remarks")}/>
           </div>
 
           <div style={{display:"flex",gap:10}}>
-            <Btn onClick={handleSave} loading={saving}>Save Entry</Btn>
+            <Btn onClick={handleSaveResult} loading={saving} icon="check">Save Result</Btn>
             <Btn variant="secondary" onClick={()=>setModal(null)}>Cancel</Btn>
           </div>
         </Modal>
