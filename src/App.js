@@ -1826,11 +1826,20 @@ function Results({user}) {
               <input type="number" min="0" max="100" step="0.5" className="form-input"
                 value={form.mark||""} onChange={f("mark")}
                 placeholder="e.g. 78"/>
-              {form.mark && form.subjectId && form.formForSubject && (
-                <p style={{fontSize:11,marginTop:4,fontWeight:700,color:GRADE_COLOR[previewGrade(form.mark,form.formForSubject)]||"#64748B"}}>
-                  Preview grade: {previewGrade(form.mark, form.formForSubject)}
-                </p>
-              )}
+              {form.mark && form.subjectId && (() => {
+                  // Find curriculum from selected subject
+                  const selSubj = isTeacher
+                    ? mySubjects.find(s=>String(s.subject_id)===String(form.subjectId))
+                    : subjects.find(s=>String(s.id)===String(form.subjectId));
+                  const curriculum = selSubj?.curriculum || "ZIMSEC_O";
+                  const preview = previewGrade(form.mark, curriculum);
+                  if (!preview) return null;
+                  return (
+                    <p style={{fontSize:11,marginTop:4,fontWeight:700,color:GRADE_COLOR[preview.g]||"#64748B"}}>
+                      Preview: {preview.g} — {preview.r}
+                    </p>
+                  );
+                })()}
             </div>
             {reportType==="mark_reader" && (
               <div className="form-group">
